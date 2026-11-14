@@ -1,0 +1,214 @@
+---
+title: "Evaluación experimental del throughput y retención de mensajes en Apache Kafka frente a un modelo analítico de Cloud Pub/Sub Lite"
+author: Alan David Monar Benalcazar
+date: 2026-11-14
+header-includes:
+  - |
+    \let\streamingOriginalMakeTitle\maketitle
+    \renewcommand{\maketitle}{%
+      \streamingOriginalMakeTitle
+      \begin{center}
+      \footnotesize
+      Escuela Superior Politécnica de Chimborazo (ESPOCH)\\
+      Ingeniería en Telemática, Octavo PAO\\
+      ETL1TP50 -- Unidad 2: Comunicación y Coordinación en Sistemas Distribuidos\\
+      14 de noviembre de 2026
+      \end{center}
+    }
+abstract: |
+  Este trabajo evalúa el throughput de publicación y consumo y la recuperación de mensajes de Apache Kafka en un broker local, y lo contrasta únicamente con un modelo analítico de capacidad de Cloud Pub/Sub Lite. Se ejecutaron nueve corridas definitivas con payloads de 1.024 bytes y cargas de 10.000, 100.000 y 1.000.000 de eventos, además de un piloto auditado. El throughput medio de publicación fue 136.965,128, 180.144,281 y 226.788,768 mensajes/s, respectivamente; los coeficientes de variación fueron 57,21 %, 41,75 % y 13,70 %. Las nueve corridas recuperaron todos los 3.330.000 eventos publicados, sin faltantes ni duplicados. La lectura con grupos nuevos confirmó la disponibilidad a los 5 y 30 segundos, pero no valida retención multidiaria. Para Pub/Sub Lite se estimó un límite de 4.048,56 eventos/s al aplicar 4 MiB/s a 1.036 bytes contabilizados por mensaje, junto con una capacidad teórica de 31.092.909 eventos en 30 GiB. El modelo no representa rendimiento observado, latencia ni pérdida. Por tratarse de un broker local único y un límite analítico de servicio, los resultados no permiten concluir superioridad entre plataformas.
+keywords: [Apache Kafka, Pub/Sub Lite, throughput, retención de mensajes, sistemas distribuidos]
+---
+
+```{python}
+#| label: setup
+#| include: false
+import csv
+import math
+import statistics
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+with Path("results.csv").open(newline="", encoding="utf-8") as f:
+    all_rows = list(csv.DictReader(f))
+
+def is_valid_definitive(row):
+    return (
+        row["benchmark_version"] == "0.3.1-audit"
+        and row["run_kind"] == "definitive"
+        and row["status"] == "ok"
+    )
+
+def is_valid_model(row):
+    return (
+        row["benchmark_version"] == "0.3.1-audit"
+        and row["run_kind"] == "analytical_capacity_bound"
+    )
+
+def as_float(row, field):
+    return float(row[field])
+
+def grouped_runs():
+    return {
+        n: sorted(
+            [r for r in all_rows if is_valid_definitive(r) and int(r["events_requested"]) == n],
+            key=lambda r: int(r["repetition"]),
+        )
+        for n in (10_000, 100_000, 1_000_000)
+    }
+
+runs_by_size = grouped_runs()
+assert all(len(v) == 3 for v in runs_by_size.values())
+```
+
+**Palabras clave—** Apache Kafka, Pub/Sub Lite, throughput, retención de mensajes, sistemas distribuidos.
+
+# I. Introducción
+
+Los sistemas de mensajería distribuida desacoplan productores y consumidores, pero su rendimiento depende de la configuración, el tamaño de evento, el grado de paralelismo y el entorno de ejecución. Kafka organiza registros en particiones y ofrece confirmaciones configurables; trabajos previos han analizado su predicción de rendimiento y su comportamiento bajo fallos de red [@wu2019performance; @raza2021benchmarking]. La literatura sobre flujos también destaca que throughput, latencia, corrección y tolerancia a fallos son dimensiones distintas [@akidau2015dataflow; @zaharia2013discretized]. Una revisión reciente caracteriza los usos y retos de Kafka en flujos de datos conectados [@raptis2023survey].
+
+El objetivo es medir throughput y recuperación de mensajes de Kafka ante tres volúmenes de eventos y contrastar esos resultados con un límite calculado a partir de la capacidad documentada de Pub/Sub Lite. La hipótesis de trabajo es que las cargas mayores amortizan parte del coste fijo de ejecución y elevan el throughput agregado; no se presupone que el servicio cloud entregue ese límite ni que sea comparable en condiciones experimentales. Pub/Sub Lite anunció su cierre para el 31 de enero de 2027 y dejó de estar disponible a nuevos clientes desde el 24 de septiembre de 2024 [@googlepubsublite2026].
+
+# II. Metodología
+
+## A. Diseño y entorno
+
+El equipo experimental tenía un Intel Core i7-1165G7 (4 núcleos y 8 hilos), 14 GiB de RAM y almacenamiento SSD NVMe, bajo Ubuntu 26.04.1 LTS. El entorno de software registrado fue Java Temurin 21.0.13+9, Python 3.14.4, `confluent-kafka` 2.16.1 y Apache Kafka 4.4.0 en modo KRaft. Kafka se ejecutó en un único broker local, una partición y factor de replicación 1; productor, consumidor y broker compartieron host y almacenamiento. Se generaron nueve topics independientes, con identificadores de ejecución únicos, para 10.000, 100.000 y 1.000.000 de mensajes de 1.024 bytes; cada tamaño tuvo tres repeticiones. Un piloto auditado de 1.000 mensajes se mantuvo separado del análisis definitivo. No se repitieron mediciones durante la elaboración del artículo.
+
+El productor usó `acks=all`, compresión desactivada, idempotencia habilitada, `linger.ms=0`, `batch.size=16.384` bytes y hasta cinco solicitudes en vuelo. Se calentó antes de medir en un topic distinto. La retención de cada topic fue `retention.ms=604.800.000` (siete días), `retention.bytes=-1`, `cleanup.policy=delete`, `segment.bytes=1.073.741.824` y `segment.ms=604.800.000`, de acuerdo con las propiedades de Kafka [@apachekafka2026]. El `acks=all` con RF=1 confirma la única réplica configurada; no demuestra durabilidad entre brokers.
+
+Se midió throughput de publicación confirmado (eventos confirmados/duración hasta completar `flush`) y throughput efectivo de consumo (eventos únicos entre primer y último mensaje, luego de asignar la partición). La asignación y el retardo hasta el primer mensaje se registraron por separado. La latencia p50, p95 y p99 es tiempo observado por la aplicación desde encolado hasta callback de entrega; incluye colas y despacho del callback, no es latencia interna del broker. Se validaron ID, secuencia, tamaño y patrón de payload. Cada lectura de recuperación empleó un grupo nuevo.
+
+## B. Análisis y modelo de capacidad
+
+Para cada escenario se usaron solo las tres corridas definitivas válidas. Se reportan media, desviación estándar muestral (denominador $n-1$) y $CV=100s/\bar{x}$. Los percentiles se mantienen por repetición: no se promedian ni se combinan como percentil global.
+
+El modelo de Pub/Sub Lite considera un topic zonal, una partición, 4 MiB/s de publicación y 30 GiB de almacenamiento por partición, valores documentados por Google [@googlepubsublite2026]. Para un payload de 1.024 bytes sin atributos, la documentación suma 12 bytes de timestamp al cálculo de almacenamiento. Aplicando como supuesto esos 1.036 bytes también al throughput se obtiene $4\cdot2^{20}/1036=4.048,56$ eventos/s; la capacidad sería $\lfloor30\cdot2^{30}/1036\rfloor=31.092.909$ eventos. Si el throughput se calcula solo con payload, el límite sería 4.096 eventos/s. Esta conversión no es una medición del servicio, ni implica latencia, pérdida o recuperación.
+
+# III. Resultados
+
+Las nueve corridas definitivas publicaron 3.330.000 eventos. Todas terminaron con estado `ok`, confirmaron y recuperaron el total solicitado, y reportaron cero faltantes, duplicados y errores. La lectura de retención a 5 s y la lectura adicional a 30 s recuperaron también todos los mensajes. La segunda espera se cuenta desde el final del consumo inicial; por ello, en el millón de eventos transcurrieron cerca de 41,94 s desde el fin de publicación hasta la lectura adicional.
+
+```{=latex}
+\begin{table*}[t]
+\centering
+\caption{Throughput y recuperación por escenario. SD: desviación estándar muestral.}
+\label{tab:kafka}
+\small
+\setlength{\tabcolsep}{8pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}r l r r r}
+\hline
+Eventos & Publicación media $\pm$ SD (msg/s) & CV (\%) & Consumo medio (msg/s) & Recuperación \\
+\hline
+10.000 & 137.000 $\pm$ 78.000 & 57,21 & 295.579 & 100 \% \\
+100.000 & 180.000 $\pm$ 75.000 & 41,75 & 196.520 & 100 \% \\
+1.000.000 & 227.000 $\pm$ 31.000 & 13,70 & 84.899 & 100 \% \\
+\hline
+\end{tabular*}
+\end{table*}
+```
+
+```{python}
+#| label: fig-pub
+#| fig-cap: "Throughput de publicación confirmado por escenario. Los puntos son las nueve corridas; las barras muestran media y una desviación estándar muestral."
+#| fig-pos: H
+#| fig-width: 3.4
+#| fig-height: 2.35
+#| fig-dpi: 220
+sizes = [10_000, 100_000, 1_000_000]
+fig, ax = plt.subplots(figsize=(3.4, 2.35))
+means, sds = [], []
+for x, size in enumerate(sizes):
+    values = [as_float(r, "publish_messages_per_s") for r in runs_by_size[size]]
+    mean, sd = statistics.mean(values), statistics.stdev(values)
+    means.append(mean)
+    sds.append(sd)
+    offsets = [-0.10, 0.0, 0.10]
+    ax.scatter([x + d for d in offsets], values, s=25, color="#2563a6",
+               edgecolor="white", linewidth=0.5, zorder=3)
+ax.errorbar(range(3), means, yerr=sds, fmt="D", color="#b33b2e", capsize=4,
+            markersize=4, linewidth=1.1, label="Media ± SD")
+ax.set_xticks(range(3), ["10 mil", "100 mil", "1 millón"])
+ax.set_ylabel("Mensajes confirmados/s")
+ax.set_xlabel("Eventos por corrida")
+ax.grid(axis="y", alpha=0.25)
+ax.legend(frameon=True, facecolor="white", framealpha=0.9, edgecolor="none",
+          loc="upper right", fontsize=8)
+ax.ticklabel_format(axis="y", style="plain")
+ax.tick_params(labelsize=8)
+ax.set_ylim(bottom=0)
+fig.tight_layout()
+plt.show()
+```
+
+La @fig-pub resume el incremento de la media y la variación entre repeticiones. El CV disminuyó con el tamaño de carga, aunque la variabilidad de 10.000 y 100.000 eventos fue considerable. No se descartaron observaciones.
+
+```{python}
+#| label: fig-lat
+#| fig-cap: "Percentil 95 de latencia de confirmación observado por la aplicación. Cada punto representa una repetición independiente."
+#| fig-pos: H
+#| fig-width: 3.4
+#| fig-height: 2.25
+#| fig-dpi: 220
+fig, ax = plt.subplots(figsize=(3.4, 2.25))
+colors = ["#2563a6", "#d28b26", "#4c956c"]
+for x, size in enumerate(sizes):
+    values = [as_float(r, "ack_latency_p95_ms") for r in runs_by_size[size]]
+    ax.scatter([x - 0.09, x, x + 0.09], values, s=29, color=colors[x],
+               edgecolor="white", linewidth=0.6)
+ax.set_xticks(range(3), ["10 mil", "100 mil", "1 millón"])
+ax.set_ylabel("Ack p95 (ms)")
+ax.set_xlabel("Eventos por corrida")
+ax.set_ylim(0, 650)
+ax.grid(axis="y", alpha=0.25)
+ax.tick_params(labelsize=8)
+fig.tight_layout()
+plt.show()
+```
+
+La @fig-lat muestra la dispersión de p95 por ejecución. Por ejemplo, para 10.000 eventos los p95 fueron 161,488, 14,035 y 16,811 ms; para 100.000, 596,821, 152,015 y 63,651 ms; y para un millón, 580,982, 396,245 y 329,157 ms. Son percentiles de poblaciones distintas y no se resumen mediante su promedio.
+
+En la Tabla \ref{tab:kafka}, la recuperación observada fue 100 %: las nueve corridas tuvieron cero faltantes y duplicados.
+
+La Tabla \ref{tab:contraste} distingue mediciones y cálculos; no es una comparación experimental.
+
+```{=latex}
+\begin{table}[H]
+\centering
+\caption{Mediciones de Kafka y modelo analítico de Pub/Sub Lite: alcances diferentes.}
+\label{tab:contraste}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.9in} p{2.45in}}
+\hline
+Sistema & Throughput y recuperación / alcance \\
+\hline
+Kafka (medido) & Publicación media: 137.000--227.000 msg/s; 3.330.000/3.330.000 recuperados en lecturas a 5 y 30 s \\
+Pub/Sub Lite & Límite analítico: 4.049 msg/s (4.096 solo payload); almacenamiento teórico de 31.092.909 eventos en una partición zonal \\
+\hline
+\end{tabular}
+\end{table}
+```
+
+# IV. Discusión
+
+La media de publicación aumentó de 136.965 a 226.789 mensajes/s entre la carga menor y la mayor. Una posible explicación es que el coste fijo de la preparación y el ciclo del cliente se amortice al procesar más registros; el agrupamiento de solicitudes también podría contribuir. Sin embargo, este diseño no aisló esos factores, por lo que son interpretaciones plausibles, no causas demostradas. La reducción del CV (57,21 %, 41,75 % y 13,70 %) coincide con resultados más estables a un millón de eventos, pero la muestra de tres repeticiones es pequeña.
+
+La primera repetición de 10.000 eventos y la primera de 100.000 exhibieron variación temporal y latencias p95 altas respecto de sus otras repeticiones. Calentamiento residual, caché de archivos y planificación del sistema operativo son factores posibles, no medidos directamente. El primer piloto histórico registró p50 de 1.041,547 ms y percentiles cercanos. Su intervalo incluía la primera publicación sin warm-up ni precarga de metadatos; el log consigna `Coordinator load in progress`. Ese mensaje no permite atribuir el reintento específicamente a la adquisición del PID ni establecer una causa única para la latencia. Como `linger.ms=0` y los callbacks se atendían con `poll()` y `flush()`, la inicialización fría sigue siendo una hipótesis, no una causalidad demostrada. El piloto auditado separó inicialización, metadatos y calentamiento, y midió p50 de 16,813 ms.
+
+La recuperación íntegra demuestra que los mensajes de estas ejecuciones permanecieron disponibles durante las lecturas de 5 y 30 s. No demuestra expiración ni durabilidad por siete días: siete días fue la política configurada y la prueba observada duró segundos. De forma similar, `acks=all` en un broker RF=1 no proporciona la tolerancia a fallos que implicaría replicación entre brokers.
+
+Pub/Sub Lite se representa únicamente mediante un cálculo analítico: se aplicó al throughput, como supuesto explícito, la sobrecarga de timestamp documentada para almacenamiento. Con solo los 1.024 bytes de payload, el límite sería 4.096 eventos/s. Ninguna de estas cifras es una medición del servicio ni permite inferir latencia, pérdida o lectura.
+
+Las principales amenazas a la validez son el único broker y almacenamiento local, el uso compartido de recursos por productor/consumidor/broker, ausencia de WAN, replicación y pruebas de fallos, solo tres repeticiones por escenario y posible variación de caché/planificación. El throughput de consumo excluye asignación y tiempo hasta el primer mensaje; estos costos se registran por separado. Los resultados representan este entorno, no una predicción general de despliegue distribuido.
+
+# V. Conclusiones
+
+En el entorno local medido, el throughput confirmado medio aumentó de 136.965 a 226.789 mensajes/s entre 10.000 y 1.000.000 de eventos. Este patrón es compatible con la hipótesis de que cargas mayores elevan el throughput agregado, pero el diseño no aisló los factores involucrados y no demuestra causalidad. Las nueve corridas recuperaron los 3.330.000 mensajes sin faltantes ni duplicados; las lecturas posteriores solo verifican disponibilidad a 5 y 30 s. El modelo de Pub/Sub Lite es una estimación analítica separada, no una medición comparable del servicio; por tanto, no se establece superioridad entre plataformas.
+
+La reproducción del artículo lee `results.csv` y genera las figuras a partir de las nueve filas definitivas; pilotos, fallo histórico y filas resumen/modelo no participan en los gráficos ni en la estadística.
+
+## Referencias
+
+::: {#refs}
+:::

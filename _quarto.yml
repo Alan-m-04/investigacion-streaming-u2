@@ -1,0 +1,32 @@
+project:
+  type: default
+  output-dir: _build
+  render:
+    - articulo.qmd
+
+lang: es
+
+bibliography: references.bib
+link-citations: true
+
+format:
+  pdf:
+    documentclass: IEEEtran
+    classoption: conference
+    pdf-engine: xelatex
+    mainfont: "Liberation Serif"
+    number-sections: false
+    colorlinks: false
+    cite-method: natbib
+    natbib: true
+    natbiboptions: numbers
+    biblio-style: IEEEtran
+    fig-pos: "tb"
+    tbl-pos: "tb"
+
+jupyter: python3
+execute:
+  echo: false
+  warning: false
+  error: false
+  cache: false
